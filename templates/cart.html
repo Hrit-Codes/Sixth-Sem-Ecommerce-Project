@@ -1,0 +1,117 @@
+{% extends 'base.html' %}
+{% block title %}Cart{% endblock %}
+{% block page_title %}Cart{% endblock %}
+{% block topbar_actions %}
+  <a href="{{ url_for('orders') }}" class="btn btn-secondary">← Back to Orders</a>
+{% endblock %}
+
+{% block content %}
+<div style="display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px;align-items:start" class="cart-layout">
+  <div class="card">
+    <div class="card-header">
+      <h2>Cart Items</h2>
+      {% if cart_items %}
+      <form method="post" action="{{ url_for('clear_cart') }}" onsubmit="return confirm('Clear the cart?')">
+        <button type="submit" class="btn btn-secondary btn-sm">Clear Cart</button>
+      </form>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if cart_items %}
+      <form method="post" action="{{ url_for('update_cart') }}">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Image</th>
+                <th>Product</th>
+                <th>Price</th>
+                <th>Qty</th>
+                <th>Subtotal</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in cart_items %}
+              <tr>
+                <td>
+                  {% if item.image_path %}
+                    <img src="{{ url_for('static', filename='uploads/' + item.image_path) }}" alt="{{ item.name }}" class="product-img">
+                  {% else %}
+                    <div class="product-img-placeholder">🍞</div>
+                  {% endif %}
+                </td>
+                <td>
+                  <strong>{{ item.name }}</strong>
+                  <div style="font-size:0.82rem;color:var(--muted)">{{ item.stock_qty }} in stock</div>
+                </td>
+                <td>NPR {{ "%.2f"|format(item.price) }}</td>
+                <td>
+                  <input type="number" name="qty_{{ item.id }}" value="{{ item.quantity }}" min="0" max="{{ item.stock_qty }}" class="form-control" style="width:90px">
+                </td>
+                <td><strong>NPR {{ "%.2f"|format(item.subtotal) }}</strong></td>
+                <td>
+                  <button type="submit" class="btn btn-danger btn-sm" formaction="{{ url_for('remove_from_cart', pid=item.id) }}" formmethod="post" onclick="return confirm('Remove {{ item.name }} from cart?')">Remove</button>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div style="margin-top:18px;display:flex;justify-content:flex-end">
+          <button type="submit" class="btn btn-primary">Update Cart</button>
+        </div>
+      </form>
+      {% else %}
+        <div class="empty-state">
+          <span class="empty-state-icon">🛒</span>
+          <p style="font-size:0.95rem;margin-bottom:8px;color:var(--text-light)">Your cart is empty.</p>
+          <p style="font-size:0.82rem">Go to Products and add items to start a new order.</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <div class="card">
+      <div class="card-header"><h2>Summary</h2></div>
+      <div class="card-body">
+        <div style="display:flex;justify-content:space-between;margin-bottom:10px">
+          <span style="color:var(--muted)">Items</span>
+          <strong>{{ cart_count }}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-top:12px;border-top:1px solid var(--tan)">
+          <span style="font-size:0.88rem;color:var(--muted)">Total</span>
+          <span class="order-total">NPR {{ "%.2f"|format(cart_total) }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2>Checkout</h2></div>
+      <div class="card-body">
+        <form method="post" action="{{ url_for('checkout_cart') }}">
+          <div class="form-group" style="margin-bottom:14px">
+            <label>Select Customer *</label>
+            <select name="customer_id" class="form-control" required {% if not cart_items %}disabled{% endif %}>
+              <option value="">— Select Customer —</option>
+              {% for c in customers %}
+              <option value="{{ c.id }}">{{ c.name }} ({{ c.email }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center" {% if not cart_items %}disabled{% endif %}>
+            Create Order from Cart
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+@media (max-width: 900px) {
+  .cart-layout { grid-template-columns: 1fr !important; }
+}
+</style>
+{% endblock %}
