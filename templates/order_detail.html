@@ -67,6 +67,33 @@
     </div>
 
     <div class="card">
+      <div class="card-header"><h2>Payment (Khalti)</h2></div>
+      <div class="card-body">
+        <div style="margin-bottom:12px">
+          <p style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:6px">Status</p>
+          <span class="badge badge-{{ order.payment_status }}">{{ (order.payment_status or 'unpaid')|title }}</span>
+        </div>
+        {% if order.payment_method %}
+        <div style="margin-bottom:12px">
+          <p style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:4px">Method</p>
+          <p style="font-size:0.88rem">{{ order.payment_method|title }}</p>
+        </div>
+        {% endif %}
+        {% if order.payment_txn_id %}
+        <div style="margin-bottom:12px">
+          <p style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:4px">Transaction ID</p>
+          <p style="font-size:0.82rem;word-break:break-all">{{ order.payment_txn_id }}</p>
+        </div>
+        {% endif %}
+        {% if order.payment_status not in ['paid'] %}
+        <form method="post" action="{{ url_for('verify_payment', oid=order.id) }}">
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Verify Payment</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2>Update Status</h2></div>
       <div class="card-body">
         <form method="post" action="{{ url_for('update_order_status', oid=order.id) }}">

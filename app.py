@@ -7,6 +7,7 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
@@ -21,11 +22,16 @@ UPLOAD_FOLDER = os.path.join('static', 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
-app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_SECURE'] = os.getenv('FLASK_ENV', 'development').lower() == 'production'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 DB_PATH = os.getenv('DB_PATH', 'bakery.db')
+
+# Khalti payment gateway
+KHALTI_BASE_URL = os.getenv('KHALTI_BASE_URL', 'https://a.khalti.com/api/v2').rstrip('/')
+KHALTI_SECRET_KEY = os.getenv('KHALTI_SECRET_KEY', '')
+KHALTI_WEBSITE_URL = os.getenv('KHALTI_WEBSITE_URL', '').rstrip('/')
 
 # ── Role permissions map ──────────────────────────────────────────────────────
 # admin   → full access
@@ -148,6 +154,26 @@ def init_db():
             );
         ''')
 
+        # Migrate order table for Khalti payment support (idempotent)
+        # Migrate customer table for customer authentication (idempotent)
+        cust_cols = {row[1] for row in c.execute('PRAGMA table_info("customer")').fetchall()}
+        if 'password_hash' not in cust_cols:
+            c.execute('ALTER TABLE customer ADD COLUMN password_hash TEXT')
+        if 'active' not in cust_cols:
+            c.execute('ALTER TABLE customer ADD COLUMN active INTEGER NOT NULL DEFAULT 1')
+
+        existing_cols = {row[1] for row in c.execute('PRAGMA table_info("order")').fetchall()}
+        new_cols = {
+            'payment_status': "TEXT NOT NULL DEFAULT 'unpaid'",
+            'payment_method': "TEXT",
+            'payment_pidx': "TEXT",
+            'payment_txn_id': "TEXT",
+            'stock_restored': "INTEGER NOT NULL DEFAULT 0",
+        }
+        for col, decl in new_cols.items():
+            if col not in existing_cols:
+                c.execute(f'ALTER TABLE "order" ADD COLUMN {col} {decl}')
+
         # Seed categories
         c.execute("SELECT COUNT(*) FROM category")
         if c.fetchone()[0] == 0:
@@ -249,6 +275,28 @@ def login_required(f):
             flash('Please log in to continue.', 'info')
             return redirect(url_for('login'))
         return f(*args, **kwargs)
+    return decorated
+
+
+def customer_login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'customer_id' not in session:
+            flash('Please log in to continue.', 'info')
+            return redirect(url_for('customer_login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def cart_access_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'customer_id' in session and 'user_id' not in session:
+            return f(*args, **kwargs)
+        flash('Cart and checkout are available to customers only.', 'info')
+        if 'user_id' in session:
+            return redirect(url_for('orders'))
+        return redirect(url_for('customer_login'))
     return decorated
 
 def requires_permission(module):
@@ -824,7 +872,7 @@ def add_order():
     return redirect(url_for('cart'))
 
 @app.route('/cart')
-@requires_permission('orders')
+@cart_access_required
 def cart():
     try:
         conn = get_db()
@@ -839,7 +887,7 @@ def cart():
         return redirect(url_for('orders'))
 
 @app.route('/cart/add/<int:pid>', methods=['POST'])
-@requires_permission('orders')
+@cart_access_required
 def add_to_cart(pid):
     try:
         qty = int(request.form.get('quantity', 1))
@@ -873,7 +921,7 @@ def add_to_cart(pid):
     return redirect(request.referrer or url_for('products'))
 
 @app.route('/cart/update', methods=['POST'])
-@requires_permission('orders')
+@cart_access_required
 def update_cart():
     try:
         conn = get_db()
@@ -901,7 +949,7 @@ def update_cart():
     return redirect(url_for('cart'))
 
 @app.route('/cart/remove/<int:pid>', methods=['POST'])
-@requires_permission('orders')
+@cart_access_required
 def remove_from_cart(pid):
     cart = get_cart()
     if str(pid) in cart:
@@ -911,7 +959,7 @@ def remove_from_cart(pid):
     return redirect(url_for('cart'))
 
 @app.route('/cart/clear', methods=['POST'])
-@requires_permission('orders')
+@cart_access_required
 def clear_cart():
     session['cart'] = {}
     session.modified = True
@@ -919,7 +967,7 @@ def clear_cart():
     return redirect(url_for('cart'))
 
 @app.route('/cart/checkout', methods=['POST'])
-@requires_permission('orders')
+@cart_access_required
 def checkout_cart():
     try:
         customer_id = int(request.form.get('customer_id', 0))
@@ -928,7 +976,7 @@ def checkout_cart():
             return redirect(url_for('cart'))
 
         conn = get_db()
-        customer = conn.execute("SELECT id FROM customer WHERE id=?", (customer_id,)).fetchone()
+        customer = conn.execute("SELECT id, name, email, phone FROM customer WHERE id=?", (customer_id,)).fetchone()
         cart_items, cart_total, cart_count = build_cart_details(conn)
 
         if not customer:
@@ -947,7 +995,15 @@ def checkout_cart():
                 flash(f"Not enough stock for {item['name']}. Please update the cart and try again.", 'danger')
                 return redirect(url_for('cart'))
 
-        cur = conn.execute('INSERT INTO "order" (customer_id, total_price) VALUES (?, ?)', (customer_id, cart_total))
+        if cart_total < 10:
+            conn.close()
+            flash('Khalti requires a minimum payment of NPR 10.00.', 'danger')
+            return redirect(url_for('cart'))
+
+        # Create order (pending payment) and reserve stock
+        cur = conn.execute(
+            'INSERT INTO "order" (customer_id, total_price, status, payment_status, payment_method) VALUES (?, ?, ?, ?, ?)',
+            (customer_id, cart_total, 'pending', 'initiated', 'khalti'))
         oid = cur.lastrowid
         for item in cart_items:
             conn.execute("INSERT INTO order_item (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
@@ -956,12 +1012,99 @@ def checkout_cart():
                          (item['quantity'], item['id']))
 
         conn.commit()
+
+        cust = conn.execute("SELECT name, email, phone FROM customer WHERE id=?", (customer_id,)).fetchone()
         conn.close()
+
         session['cart'] = {}
         session.modified = True
-        logger.info(f'Order created from cart: #{oid} with total NPR {cart_total:.2f}')
-        flash(f'Order #{oid} created from cart. Total: NPR {cart_total:.2f}', 'success')
-        return redirect(url_for('order_detail', oid=oid))
+
+        # Initiate Khalti payment
+        amount_paisa = int(round(cart_total * 100))
+        return_url = url_for('khalti_callback', _external=True)
+        website_url = KHALTI_WEBSITE_URL or request.host_url.rstrip('/')
+        payload = {
+            'return_url': return_url,
+            'website_url': website_url,
+            'amount': amount_paisa,
+            'purchase_order_id': str(oid),
+            'purchase_order_name': f'Order #{oid}',
+            'customer_info': {
+                'name': cust['name'],
+                'email': cust['email'],
+            },
+        }
+        if cust['phone']:
+            payload['customer_info']['phone'] = cust['phone']
+        payload['product_details'] = [
+            {
+                'identity': str(item['id']),
+                'name': item['name'],
+                'total_price': int(round(item['subtotal'] * 100)),
+                'quantity': item['quantity'],
+                'unit_price': int(round(item['price'] * 100)),
+            }
+            for item in cart_items
+        ]
+
+        headers = {
+            'Authorization': f'Key {KHALTI_SECRET_KEY}',
+            'Content-Type': 'application/json',
+        }
+        try:
+            resp = requests.post(f'{KHALTI_BASE_URL}/epayment/initiate/', json=payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            logger.error(f'Khalti initiate request failed: {e}')
+            # restore stock and cancel order
+            rconn = get_db()
+            items = rconn.execute("SELECT product_id, quantity FROM order_item WHERE order_id=?", (oid,)).fetchall()
+            for it in items:
+                rconn.execute("UPDATE product SET stock_qty = stock_qty + ? WHERE id=?", (it['quantity'], it['product_id']))
+            rconn.execute('UPDATE "order" SET payment_status=?, status=?, stock_restored=1 WHERE id=?', ('failed', 'cancelled', oid))
+            rconn.commit()
+            rconn.close()
+            flash('Could not reach Khalti. Order cancelled and stock restored.', 'danger')
+            return redirect(url_for('cart'))
+
+        if resp.status_code != 200:
+            logger.error(f'Khalti initiate failed: {resp.status_code} {resp.text}')
+            rconn = get_db()
+            items = rconn.execute("SELECT product_id, quantity FROM order_item WHERE order_id=?", (oid,)).fetchall()
+            for it in items:
+                rconn.execute("UPDATE product SET stock_qty = stock_qty + ? WHERE id=?", (it['quantity'], it['product_id']))
+            rconn.execute('UPDATE "order" SET payment_status=?, status=?, stock_restored=1 WHERE id=?', ('failed', 'cancelled', oid))
+            rconn.commit()
+            rconn.close()
+            try:
+                err = resp.json()
+                msg = err.get('detail') or err
+            except Exception:
+                msg = resp.text
+            flash(f'Khalti payment initiation failed: {msg}', 'danger')
+            return redirect(url_for('cart'))
+
+        data = resp.json()
+        pidx = data.get('pidx')
+        payment_url = data.get('payment_url')
+        if not pidx or not payment_url:
+            logger.error(f'Khalti initiate missing pidx/payment_url: {data}')
+            rconn = get_db()
+            items = rconn.execute("SELECT product_id, quantity FROM order_item WHERE order_id=?", (oid,)).fetchall()
+            for it in items:
+                rconn.execute("UPDATE product SET stock_qty = stock_qty + ? WHERE id=?", (it['quantity'], it['product_id']))
+            rconn.execute('UPDATE "order" SET payment_status=?, status=?, stock_restored=1 WHERE id=?', ('failed', 'cancelled', oid))
+            rconn.commit()
+            rconn.close()
+            flash('Khalti payment initiation failed.', 'danger')
+            return redirect(url_for('cart'))
+
+        rconn = get_db()
+        rconn.execute('UPDATE "order" SET payment_pidx=? WHERE id=?', (pidx, oid))
+        rconn.commit()
+        rconn.close()
+
+        logger.info(f'Order #{oid} created and Khalti payment initiated (pidx={pidx})')
+        return redirect(payment_url)
     except ValueError:
         flash('Invalid customer selection.', 'danger')
         return redirect(url_for('cart'))
@@ -969,6 +1112,284 @@ def checkout_cart():
         logger.error(f'Error during cart checkout: {e}')
         flash('Error during checkout.', 'danger')
         return redirect(url_for('cart'))
+
+@app.route('/khalti/callback', methods=['GET'])
+def khalti_callback():
+    pidx = request.args.get('pidx')
+    status = request.args.get('status')
+    purchase_order_id = request.args.get('purchase_order_id')
+    transaction_id = request.args.get('transaction_id') or request.args.get('tidx')
+    amount = request.args.get('amount')
+
+    conn = get_db()
+    order = None
+    if pidx:
+        order = conn.execute('SELECT * FROM "order" WHERE payment_pidx=?', (pidx,)).fetchone()
+    if not order and purchase_order_id:
+        try:
+            oid = int(purchase_order_id)
+            order = conn.execute('SELECT * FROM "order" WHERE id=?', (oid,)).fetchone()
+        except (ValueError, TypeError):
+            order = None
+
+    if not order:
+        conn.close()
+        flash('Order not found for this payment.', 'danger')
+        return redirect(url_for('orders') if 'user_id' in session else url_for('login'))
+
+    oid = order['id']
+
+    # Idempotent: already paid
+    if order['payment_status'] == 'paid':
+        conn.close()
+        flash(f'Order #{oid} is already paid.', 'info')
+        if 'user_id' in session:
+            return redirect(url_for('order_detail', oid=oid))
+        return redirect(url_for('login'))
+
+    verified_status = None
+    verified_txn = None
+    verified_amount = None
+    if pidx and KHALTI_SECRET_KEY:
+        try:
+            r = requests.post(
+                f'{KHALTI_BASE_URL}/epayment/lookup/',
+                json={'pidx': pidx},
+                headers={'Authorization': f'Key {KHALTI_SECRET_KEY}', 'Content-Type': 'application/json'},
+                timeout=30)
+            if r.status_code in (200, 400):
+                data = r.json()
+                verified_status = data.get('status')
+                verified_txn = data.get('transaction_id')
+                verified_amount = data.get('total_amount')
+        except Exception as e:
+            logger.error(f'Khalti lookup failed: {e}')
+
+    final_status = verified_status or status
+
+    if final_status == 'Completed':
+        expected_paisa = int(round(float(order['total_price']) * 100))
+        if verified_amount is not None and int(verified_amount) != expected_paisa:
+            conn.execute('UPDATE "order" SET payment_status=? WHERE id=?', ('amount_mismatch', oid))
+            conn.commit()
+            conn.close()
+            flash('Payment amount mismatch. Please contact support.', 'danger')
+            if 'user_id' in session:
+                return redirect(url_for('order_detail', oid=oid))
+            return redirect(url_for('login'))
+        conn.execute(
+            'UPDATE "order" SET payment_status=?, payment_txn_id=? WHERE id=?',
+            ('paid', verified_txn or transaction_id, oid))
+        conn.commit()
+        conn.close()
+        logger.info(f'Order #{oid} payment completed (txn={verified_txn or transaction_id})')
+        flash(f'Payment successful for order #{oid}.', 'success')
+    elif final_status in ('User canceled', 'Expired', 'Failed', 'Canceled'):
+        if not order['stock_restored']:
+            items = conn.execute("SELECT product_id, quantity FROM order_item WHERE order_id=?", (oid,)).fetchall()
+            for it in items:
+                conn.execute("UPDATE product SET stock_qty = stock_qty + ? WHERE id=?", (it['quantity'], it['product_id']))
+            conn.execute('UPDATE "order" SET stock_restored=1 WHERE id=?', (oid,))
+        conn.execute('UPDATE "order" SET payment_status=?, status=? WHERE id=?', ('failed', 'cancelled', oid))
+        conn.commit()
+        conn.close()
+        flash(f'Payment {final_status}. Order #{oid} cancelled.', 'warning')
+    else:
+        conn.execute('UPDATE "order" SET payment_status=? WHERE id=?', ('pending', oid))
+        conn.commit()
+        conn.close()
+        flash('Payment is pending. Please complete or retry the payment.', 'info')
+
+    if 'user_id' in session:
+        return redirect(url_for('order_detail', oid=oid))
+    if 'customer_id' in session:
+        return redirect(url_for('customer_order_detail', oid=oid))
+    return redirect(url_for('login'))
+
+
+@app.route('/orders/<int:oid>/verify-payment', methods=['POST'])
+@requires_permission('orders')
+def verify_payment(oid):
+    conn = get_db()
+    order = conn.execute('SELECT * FROM "order" WHERE id=?', (oid,)).fetchone()
+    if not order:
+        conn.close()
+        flash('Order not found.', 'danger')
+        return redirect(url_for('orders'))
+    pidx = order['payment_pidx']
+    if not pidx:
+        conn.close()
+        flash('No payment reference for this order.', 'warning')
+        return redirect(url_for('order_detail', oid=oid))
+    if order['payment_status'] == 'paid':
+        conn.close()
+        flash('Order already paid.', 'info')
+        return redirect(url_for('order_detail', oid=oid))
+    try:
+        r = requests.post(
+            f'{KHALTI_BASE_URL}/epayment/lookup/',
+            json={'pidx': pidx},
+            headers={'Authorization': f'Key {KHALTI_SECRET_KEY}', 'Content-Type': 'application/json'},
+            timeout=30)
+        data = r.json() if r.status_code in (200, 400) else {}
+    except Exception as e:
+        logger.error(f'Khalti lookup failed: {e}')
+        data = {}
+    status = data.get('status')
+    if status == 'Completed':
+        conn.execute('UPDATE "order" SET payment_status=?, payment_txn_id=? WHERE id=?',
+                     ('paid', data.get('transaction_id'), oid))
+        conn.commit()
+        conn.close()
+        flash('Payment verified successfully.', 'success')
+    elif status in ('User canceled', 'Expired', 'Failed', 'Canceled'):
+        if not order['stock_restored']:
+            items = conn.execute("SELECT product_id, quantity FROM order_item WHERE order_id=?", (oid,)).fetchall()
+            for it in items:
+                conn.execute("UPDATE product SET stock_qty = stock_qty + ? WHERE id=?", (it['quantity'], it['product_id']))
+            conn.execute('UPDATE "order" SET stock_restored=1 WHERE id=?', (oid,))
+        conn.execute('UPDATE "order" SET payment_status=?, status=? WHERE id=?', ('failed', 'cancelled', oid))
+        conn.commit()
+        conn.close()
+        flash(f'Payment {status}. Order cancelled.', 'warning')
+    else:
+        conn.close()
+        flash(f'Payment status: {status or "unknown"}.', 'info')
+    return redirect(url_for('order_detail', oid=oid))
+
+
+# ── Customer portal ────────────────────────────────────────────────────────────
+
+@app.route('/customer/login', methods=['GET', 'POST'])
+def customer_login():
+    if 'customer_id' in session:
+        return redirect(url_for('customer_dashboard'))
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        if not email or not password:
+            flash('Email and password are required.', 'danger')
+            return render_template('customer_login.html')
+        conn = get_db()
+        cust = conn.execute("SELECT * FROM customer WHERE lower(email)=?", (email,)).fetchone()
+        conn.close()
+        if cust and cust['password_hash'] and check_password_hash(cust['password_hash'], password):
+            if not cust['active']:
+                flash('This account is disabled.', 'danger')
+                return render_template('customer_login.html')
+            session['customer_id'] = cust['id']
+            session['customer_name'] = cust['name']
+            session['name'] = cust['name']
+            session['role'] = 'customer'
+            session.modified = True
+            flash(f"Welcome back, {cust['name']}!", 'success')
+            return redirect(url_for('customer_dashboard'))
+        flash('Invalid email or password.', 'danger')
+    return render_template('customer_login.html')
+
+
+@app.route('/customer/register', methods=['GET', 'POST'])
+def customer_register():
+    if 'customer_id' in session:
+        return redirect(url_for('customer_dashboard'))
+    if request.method == 'POST':
+        name = sanitize_input(request.form.get('name', ''))
+        email = request.form.get('email', '').strip().lower()
+        phone = request.form.get('phone', '').strip()
+        address = sanitize_input(request.form.get('address', ''))
+        password = request.form.get('password', '')
+        confirm = request.form.get('confirm_password', '')
+        if not all([name, email, password]):
+            flash('Name, email and password are required.', 'danger')
+            return render_template('customer_register.html')
+        if not validate_email(email):
+            flash('Please enter a valid email address.', 'danger')
+            return render_template('customer_register.html')
+        if password != confirm:
+            flash('Passwords do not match.', 'danger')
+            return render_template('customer_register.html')
+        valid, msg = validate_password(password)
+        if not valid:
+            flash(msg, 'danger')
+            return render_template('customer_register.html')
+        conn = get_db()
+        existing = conn.execute("SELECT id FROM customer WHERE lower(email)=?", (email,)).fetchone()
+        if existing:
+            conn.close()
+            flash('An account with this email already exists.', 'danger')
+            return render_template('customer_register.html')
+        conn.execute(
+            "INSERT INTO customer (name, email, phone, address, password_hash) VALUES (?,?,?,?,?)",
+            (name, email, phone, address, generate_password_hash(password)))
+        conn.commit()
+        cust = conn.execute("SELECT id, name FROM customer WHERE lower(email)=?", (email,)).fetchone()
+        conn.close()
+        session['customer_id'] = cust['id']
+        session['customer_name'] = cust['name']
+        session['name'] = cust['name']
+        session['role'] = 'customer'
+        session.modified = True
+        flash('Account created successfully. Welcome!', 'success')
+        return redirect(url_for('customer_dashboard'))
+    return render_template('customer_register.html')
+
+
+@app.route('/customer/logout')
+def customer_logout():
+    session.pop('customer_id', None)
+    session.pop('customer_name', None)
+    if 'user_id' not in session:
+        session.pop('role', None)
+        session.pop('name', None)
+    session.modified = True
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('customer_login'))
+
+
+@app.route('/customer')
+@app.route('/customer/dashboard')
+@customer_login_required
+def customer_dashboard():
+    try:
+        conn = get_db()
+        cust = conn.execute("SELECT * FROM customer WHERE id=?", (session['customer_id'],)).fetchone()
+        products = conn.execute(
+            '''SELECT p.*, c.name as category_name
+               FROM product p LEFT JOIN category c ON p.category_id = c.id
+               ORDER BY p.name''').fetchall()
+        cart_items, cart_total, cart_count = build_cart_details(conn)
+        conn.close()
+        return render_template('customer_shop.html', customer=cust, products=products,
+                               cart_items=cart_items, cart_total=cart_total, cart_count=cart_count)
+    except Exception as e:
+        logger.error(f'Customer dashboard error: {e}')
+        flash('Error loading dashboard.', 'danger')
+        return redirect(url_for('customer_login'))
+
+
+@app.route('/customer/orders/<int:oid>')
+@customer_login_required
+def customer_order_detail(oid):
+    try:
+        conn = get_db()
+        order = conn.execute(
+            'SELECT * FROM "order" WHERE id=? AND customer_id=?',
+            (oid, session['customer_id'])).fetchone()
+        if not order:
+            conn.close()
+            flash('Order not found.', 'danger')
+            return redirect(url_for('customer_dashboard'))
+        items = conn.execute(
+            '''SELECT oi.*, p.name as product_name, p.image_path
+               FROM order_item oi JOIN product p ON oi.product_id=p.id
+               WHERE oi.order_id=?''', (oid,)).fetchall()
+        conn.close()
+        return render_template('customer_order_detail.html', order=order, items=items)
+    except Exception as e:
+        logger.error(f'Customer order detail error: {e}')
+        flash('Error loading order.', 'danger')
+        return redirect(url_for('customer_dashboard'))
+
 
 @app.route('/orders/<int:oid>')
 @requires_permission('orders')

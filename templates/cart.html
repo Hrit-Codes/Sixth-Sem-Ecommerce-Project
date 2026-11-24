@@ -91,17 +91,25 @@
       <div class="card-header"><h2>Checkout</h2></div>
       <div class="card-body">
         <form method="post" action="{{ url_for('checkout_cart') }}">
-          <div class="form-group" style="margin-bottom:14px">
-            <label>Select Customer *</label>
-            <select name="customer_id" class="form-control" required {% if not cart_items %}disabled{% endif %}>
-              <option value="">— Select Customer —</option>
-              {% for c in customers %}
-              <option value="{{ c.id }}">{{ c.name }} ({{ c.email }})</option>
-              {% endfor %}
-            </select>
-          </div>
+          {% if session.get('customer_id') and not session.get('user_id') %}
+            <input type="hidden" name="customer_id" value="{{ session.get('customer_id') }}">
+            <div class="form-group" style="margin-bottom:14px">
+              <label>Ordering as</label>
+              <input class="form-control" type="text" value="{{ session.get('customer_name') or session.get('name') }}" disabled>
+            </div>
+          {% else %}
+            <div class="form-group" style="margin-bottom:14px">
+              <label>Select Customer *</label>
+              <select name="customer_id" class="form-control" required {% if not cart_items %}disabled{% endif %}>
+                <option value="">— Select Customer —</option>
+                {% for c in customers %}
+                <option value="{{ c.id }}">{{ c.name }} ({{ c.email }})</option>
+                {% endfor %}
+              </select>
+            </div>
+          {% endif %}
           <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center" {% if not cart_items %}disabled{% endif %}>
-            Create Order from Cart
+            Checkout &amp; Pay with Khalti
           </button>
         </form>
       </div>

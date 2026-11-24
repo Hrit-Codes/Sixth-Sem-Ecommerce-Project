@@ -2,38 +2,9 @@
 {% block title %}Orders{% endblock %}
 {% block page_title %}Orders{% endblock %}
 {% block topbar_actions %}
-  <a href="{{ url_for('cart') }}" class="btn btn-primary">🛒 View Cart{% if cart_count %} ({{ cart_count }}){% endif %}</a>
 {% endblock %}
 
 {% block content %}
-<div class="card" style="margin-bottom:20px">
-  <div class="card-header">
-    <h2>Cart Summary</h2>
-    <a href="{{ url_for('cart') }}" class="btn btn-secondary btn-sm">Open Cart</a>
-  </div>
-  <div class="card-body">
-    {% if cart_items %}
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap">
-        <div>
-          <p style="margin-bottom:6px;font-weight:600">{{ cart_count }} item(s) ready for checkout</p>
-          <p style="color:var(--muted);font-size:0.9rem">Current cart total: <strong>NPR {{ "%.2f"|format(cart_total) }}</strong></p>
-        </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <a href="{{ url_for('cart') }}" class="btn btn-primary">Proceed to Checkout</a>
-          <form method="post" action="{{ url_for('clear_cart') }}" onsubmit="return confirm('Clear the cart?')">
-            <button type="submit" class="btn btn-secondary">Clear Cart</button>
-          </form>
-        </div>
-      </div>
-    {% else %}
-      <div class="empty-state" style="padding:10px 0">
-        <span class="empty-state-icon">🛒</span>
-        <p style="font-size:0.95rem;margin-bottom:8px;color:var(--text-light)">Your cart is empty.</p>
-        <p style="font-size:0.82rem">Add products from the Products page, then checkout from the cart.</p>
-      </div>
-    {% endif %}
-  </div>
-</div>
 
 <div class="card">
   <div class="card-body" style="padding-bottom:0">

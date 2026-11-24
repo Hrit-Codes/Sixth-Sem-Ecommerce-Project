@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block title %}Shop{% endblock %}
+{% block page_title %}Shop Products{% endblock %}
+{% block topbar_actions %}
+  <a href="{{ url_for('cart') }}" class="btn btn-secondary">🛒 Cart ({{ cart_count }})</a>
+  <a href="{{ url_for('customer_logout') }}" class="btn btn-secondary">Logout</a>
+{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-header"><h2>Available Products</h2></div>
+  <div class="card-body">
+    {% if products %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px">
+      {% for p in products %}
+      <div class="card" style="margin:0">
+        <div class="card-body" style="text-align:center">
+          {% if p.image_path %}
+            <img src="{{ url_for('static', filename='uploads/' + p.image_path) }}" alt="{{ p.name }}" style="width:100%;height:150px;object-fit:cover;border-radius:8px;margin-bottom:10px">
+          {% else %}
+            <div style="width:100%;height:150px;display:flex;align-items:center;justify-content:center;font-size:3rem;background:var(--tan,#f5efe6);border-radius:8px;margin-bottom:10px">🍞</div>
+          {% endif %}
+          <h3 style="font-size:1rem;margin-bottom:4px">{{ p.name }}</h3>
+          <p style="font-size:0.82rem;color:var(--muted);margin-bottom:6px">{{ p.category_name or '' }}</p>
+          <p style="font-weight:600;margin-bottom:8px">NPR {{ "%.2f"|format(p.price) }}</p>
+          <p style="font-size:0.82rem;color:var(--muted);margin-bottom:10px">{{ p.stock_qty }} in stock</p>
+          <form method="post" action="{{ url_for('add_to_cart', pid=p.id) }}">
+            <input type="hidden" name="quantity" value="1">
+            <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center" {% if p.stock_qty <= 0 %}disabled{% endif %}>
+              {% if p.stock_qty <= 0 %}Out of Stock{% else %}Add to Cart{% endif %}
+            </button>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <span class="empty-state-icon">📦</span>
+      <p>No products available.</p>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
